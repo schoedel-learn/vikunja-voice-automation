@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 GitHub Discussions
+    url: https://github.com/YOUR-USERNAME/vikunja-voice-automation/discussions
+    about: Ask questions, share ideas, and discuss with the community
+  - name: 📚 Documentation
+    url: https://github.com/YOUR-USERNAME/vikunja-voice-automation/tree/main/docs
+    about: Check out our comprehensive documentation
+  - name: 🔐 Security Vulnerability
+    url: https://github.com/YOUR-USERNAME/vikunja-voice-automation/security/advisories/new
+    about: Report security vulnerabilities privately
+
