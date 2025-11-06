@@ -1,0 +1,367 @@
+{
+  "name": "Voice to Vikunja Tasks (SFTP)",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "/inbox",
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "options": {
+          "fileExtensions": "txt"
+        }
+      },
+      "name": "SFTP Trigger - Voice Notes",
+      "type": "n8n-nodes-base.sftpTrigger",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "id": "sftp-trigger",
+      "credentials": {
+        "sftp": {
+          "id": "1",
+          "name": "SFTPGo Voice Notes"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "path": "={{$json.path}}",
+        "options": {}
+      },
+      "name": "Read Transcript File",
+      "type": "n8n-nodes-base.sftp",
+      "typeVersion": 1,
+      "position": [450, 300],
+      "id": "read-file",
+      "credentials": {
+        "sftp": {
+          "id": "1",
+          "name": "SFTPGo Voice Notes"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Extract text from downloaded file\nconst fileData = $input.item.binary.data;\nconst transcriptText = fileData.toString('utf-8');\nconst fileName = $input.item.json.filename || 'voice_note';\nconst filePath = $input.item.json.path;\n\nreturn {\n  json: {\n    transcript: transcriptText,\n    fileName: fileName,\n    filePath: filePath,\n    receivedDate: new Date().toISOString()\n  }\n};"
+      },
+      "name": "Extract Text Content",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300],
+      "id": "extract-text"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Prepare prompt for GPT-4o\nconst transcript = $input.item.json.transcript;\n\nreturn {\n  json: {\n    transcript: transcript,\n    fileName: $input.item.json.fileName,\n    filePath: $input.item.json.filePath,\n    prompt: `I have this voice note transcript from Google Recorder:\\n\\n\"${transcript}\"\\n\\nPlease analyze this transcript and extract individual tasks. First, call list_projects() to see what Vikunja projects are available. Then create each task in the most appropriate project based on the content. Use context clues to determine which project each task belongs to.`\n  }\n};"
+      },
+      "name": "Prepare GPT-4o Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 300],
+      "id": "prepare-gpt4o"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a task extraction assistant. When given voice note transcripts, you extract individual tasks and create them in Vikunja using the available functions. Always call list_projects first to see available projects, then create each task in the most appropriate project based on context.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"{{$json.prompt}}\"\n    }\n  ],\n  \"tools\": [\n    {\n      \"type\": \"function\",\n      \"function\": {\n        \"name\": \"list_projects\",\n        \"description\": \"Get all available Vikunja projects with their IDs and titles\",\n        \"parameters\": {\n          \"type\": \"object\",\n          \"properties\": {},\n          \"required\": []\n        }\n      }\n    },\n    {\n      \"type\": \"function\",\n      \"function\": {\n        \"name\": \"create_task\",\n        \"description\": \"Create a new task in a Vikunja project\",\n        \"parameters\": {\n          \"type\": \"object\",\n          \"properties\": {\n            \"project_id\": {\n              \"type\": \"integer\",\n              \"description\": \"The ID of the project to create the task in\"\n            },\n            \"title\": {\n              \"type\": \"string\",\n              \"description\": \"Task title/summary\"\n            },\n            \"description\": {\n              \"type\": \"string\",\n              \"description\": \"Detailed task description\"\n            },\n            \"priority\": {\n              \"type\": \"integer\",\n              \"description\": \"Priority: 0=unset, 1=low, 2=medium, 3=high, 4=urgent, 5=do now\",\n              \"default\": 0\n            }\n          },\n          \"required\": [\"project_id\", \"title\"]\n        }\n      }\n    }\n  ],\n  \"tool_choice\": \"auto\"\n}",
+        "options": {}
+      },
+      "name": "GPT-4o with Functions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1050, 300],
+      "id": "gpt-call",
+      "credentials": {
+        "openAiApi": {
+          "id": "2",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Handle GPT function calling and execute Vikunja API calls\nconst response = $input.item.json;\nconst message = response.choices[0].message;\n\nconst results = {\n  functions_called: [],\n  tasks_to_create: [],\n  conversation_id: response.id,\n  originalFileName: $input.first().json.fileName,\n  originalFilePath: $input.first().json.filePath\n};\n\n// Parse function calls from GPT\nif (message.tool_calls) {\n  for (const toolCall of message.tool_calls) {\n    const functionName = toolCall.function.name;\n    const args = JSON.parse(toolCall.function.arguments);\n    \n    results.functions_called.push({\n      id: toolCall.id,\n      function: functionName,\n      arguments: args\n    });\n    \n    // Queue tasks for creation\n    if (functionName === 'create_task') {\n      results.tasks_to_create.push(args);\n    }\n  }\n}\n\nreturn {\n  json: results\n};"
+      },
+      "name": "Parse Function Calls",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 300],
+      "id": "parse-functions"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://tasks.opshub.host/api/v1/projects",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer tk_40f55f71353b7ee59f9d04119ffab4fe5432df19"
+            }
+          ]
+        }
+      },
+      "name": "Get Vikunja Projects",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1450, 200],
+      "id": "get-projects",
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "name": "Split Tasks",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1450, 300],
+      "id": "split-tasks"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get task to create from the batch\nconst taskData = $input.item.json.tasks_to_create[$input.context.noItemsLeft];\n\nreturn {\n  json: taskData\n};"
+      },
+      "name": "Get Current Task",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1650, 300],
+      "id": "get-task"
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://tasks.opshub.host/api/v1/projects/{{$json.project_id}}/tasks",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer tk_40f55f71353b7ee59f9d04119ffab4fe5432df19"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"title\": \"{{$json.title}}\",\n  \"description\": \"{{$json.description}}\",\n  \"priority\": {{$json.priority || 0}}\n}"
+      },
+      "name": "Create Task in Vikunja",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1850, 300],
+      "id": "create-task"
+    },
+    {
+      "parameters": {
+        "operation": "rename",
+        "oldPath": "={{$('Parse Function Calls').item.json.originalFilePath}}",
+        "newPath": "=/processed/{{$('Parse Function Calls').item.json.originalFileName}}"
+      },
+      "name": "Move to Processed Folder",
+      "type": "n8n-nodes-base.sftp",
+      "typeVersion": 1,
+      "position": [2050, 400],
+      "id": "move-file",
+      "credentials": {
+        "sftp": {
+          "id": "1",
+          "name": "SFTPGo Voice Notes"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Collect all created tasks\nconst allItems = $input.all();\nconst tasksCreated = allItems.filter(item => item.json.id);\nconst fileName = $('Parse Function Calls').first().json.originalFileName;\n\nlet summary = '✅ Voice Note Processed Successfully!\\n\\n';\nsummary += `📁 File: ${fileName}\\n`;\nsummary += `📊 Created ${tasksCreated.length} task(s):\\n\\n`;\n\nfor (const task of tasksCreated) {\n  summary += `📌 ${task.json.title}\\n`;\n  if (task.json.description) {\n    summary += `   ${task.json.description.substring(0, 80)}...\\n`;\n  }\n  summary += `   🔗 https://tasks.opshub.host/tasks/${task.json.id}\\n\\n`;\n}\n\nsummary += '\\n🎉 All tasks have been added to Vikunja!\\n';\nsummary += '\\n---\\n';\nsummary += 'Sent via Voice-to-Tasks Automation (SFTP)';\n\nreturn {\n  json: {\n    subject: '✅ Tasks Created from Voice Note',\n    body: summary,\n    tasks_count: tasksCreated.length,\n    file_name: fileName\n  }\n};"
+      },
+      "name": "Prepare Confirmation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2050, 300],
+      "id": "prepare-confirmation"
+    },
+    {
+      "parameters": {
+        "fromEmail": "n8n@opshub.host",
+        "toEmail": "your.email@example.com",
+        "subject": "={{$json.subject}}",
+        "text": "={{$json.body}}",
+        "options": {}
+      },
+      "name": "Send Confirmation Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [2250, 300],
+      "id": "send-confirmation",
+      "credentials": {
+        "smtp": {
+          "id": "3",
+          "name": "Email SMTP"
+        }
+      },
+      "notes": "Optional: Remove this node if you don't want email notifications"
+    }
+  ],
+  "connections": {
+    "SFTP Trigger - Voice Notes": {
+      "main": [
+        [
+          {
+            "node": "Read Transcript File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Transcript File": {
+      "main": [
+        [
+          {
+            "node": "Extract Text Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Text Content": {
+      "main": [
+        [
+          {
+            "node": "Prepare GPT-4o Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare GPT-4o Request": {
+      "main": [
+        [
+          {
+            "node": "GPT-4o with Functions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GPT-4o with Functions": {
+      "main": [
+        [
+          {
+            "node": "Parse Function Calls",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Function Calls": {
+      "main": [
+        [
+          {
+            "node": "Get Vikunja Projects",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Split Tasks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Tasks": {
+      "main": [
+        [
+          {
+            "node": "Get Current Task",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Confirmation",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Move to Processed Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Current Task": {
+      "main": [
+        [
+          {
+            "node": "Create Task in Vikunja",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Task in Vikunja": {
+      "main": [
+        [
+          {
+            "node": "Split Tasks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Send Confirmation Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {},
+  "tags": []
+}
+
+
