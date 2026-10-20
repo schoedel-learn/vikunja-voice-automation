@@ -7,8 +7,8 @@ echo "================================="
 echo ""
 
 # Configuration
-N8N_SERVER="REDACTED"
-N8N_PASSWORD="***REMOVED***"
+N8N_SERVER="${N8N_SERVER:?export N8N_SERVER first}"
+N8N_PASSWORD="${N8N_PASSWORD:?export N8N_PASSWORD first}"
 WORKFLOW_FILE="n8n/voice-to-vikunja-txt.json"
 
 # Check if workflow file exists
